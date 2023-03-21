@@ -70,7 +70,14 @@ let start_server address ~n_workers =
     let cmd =
       ("", [| Sys.argv.(0); "--worker"; Remote_commit.list_to_string commits |])
     in
-    Lwt_process.open_process cmd
+    let i, o = Unix.open_process (String.concat "" (Array.to_list (snd cmd))) in
+    
+    object
+      method stdin = i
+      method stdout = o
+    end
+    (* Eio_unix. *)
+    (* Lwt_process.open_process cmd *)
   in
   let* service = Service.v ~n_workers ~create_worker in
   let restore = Capnp_rpc_net.Restorer.single service_id service in

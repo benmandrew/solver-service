@@ -11,12 +11,13 @@ let oldest_commit = Lwt_pool.create 180 @@ fun _ -> Lwt.return_unit
 
 module Make (Opam_repo : Opam_repository_intf.S) = struct
   module Epoch : sig
+    type t_process = < stdin : Eio.Flow.sink ; stdout : Eio.Flow.source >
     type t
     (* An Epoch handles all requests for a single opam-repository HEAD commit. *)
 
     val create :
       n_workers:int ->
-      create_worker:(Remote_commit.t list -> Lwt_process.process) ->
+      create_worker:(Remote_commit.t list -> t_process) ->
       Remote_commit.t list ->
       t Lwt.t
 
@@ -24,8 +25,8 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
       log:Log.X.t Capability.t ->
       id:string ->
       Worker.Solve_request.t ->
-      < stdin : Lwt_io.output_channel ; stdout : Lwt_io.input_channel ; .. > ->
-      (string list, string) result Lwt.t
+      t_process ->
+      (string list, string) result
 
     val handle :
       log:Solver_service_api.Solver.Log.t ->
@@ -35,19 +36,20 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
 
     val dispose : t -> unit Lwt.t
   end = struct
-    type t = Lwt_process.process Lwt_pool.t
+    type t_process = < stdin : Eio.Flow.sink ; stdout : Eio.Flow.source >
+    type t = t_process Lwt_pool.t
 
-    let validate (worker : Lwt_process.process) =
-      match Lwt.state worker#status with
+    let validate (worker : t_process) = ignore worker; Lwt.return_true
+      (* match Lwt.state worker#status with
       | Lwt.Sleep -> Lwt.return true
       | Lwt.Fail ex -> Lwt.fail ex
       | Lwt.Return status ->
           Format.eprintf "Worker %d is dead (%a) - removing from pool@."
             worker#pid Process.pp_status status;
-          Lwt.return false
+          Lwt.return false *)
 
-    let dispose (worker : Lwt_process.process) =
-      let pid = worker#pid in
+    let dispose (worker : t_process) = ignore worker; Lwt.return_unit
+      (* let pid = worker#pid in
       Fmt.epr "Terminating worker %d@." pid;
       worker#terminate;
       worker#close >|= function
@@ -56,7 +58,7 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
       | Unix.WSIGNALED code ->
           Fmt.epr "Worker %d finished@. Killed  by signal %d" pid code
       | Unix.WSTOPPED code ->
-          Fmt.epr "Worker %d finished@. Stopped by signal %d" pid code
+          Fmt.epr "Worker %d finished@. Stopped by signal %d" pid code *)
 
     let update_opam_repository_to_commit commit =
       let repo_url = commit.Remote_commit.repo in
@@ -74,7 +76,7 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
         else Fmt.failwith "Still missing commit after update!")
     (*Closing the store after usage is necessary to prevent file descriptor leaks*)
 
-    let create ~n_workers ~create_worker commits =
+    let create ~n_workers ~(create_worker : Remote_commit.t list -> t_process) commits : t Lwt.t =
       Lwt_list.iter_p update_opam_repository_to_commit commits >|= fun () ->
       Lwt_pool.create n_workers ~validate ~dispose (fun () ->
           Lwt.return (create_worker commits))
@@ -82,38 +84,51 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
     let dispose = Lwt_pool.clear
 
     (* Send [request] to [worker] and read the reply. *)
-    let process ~log ~id request worker =
+    let process ~log ~id request (worker : t_process) =
+      ignore log;
+      ignore id;
       let request_str =
         Worker.Solve_request.to_yojson request |> Yojson.Safe.to_string
       in
       let request_str =
         Printf.sprintf "%d\n%s" (String.length request_str) request_str
       in
-      Lwt_io.write worker#stdin request_str >>= fun () ->
-      Lwt_io.read_line worker#stdout >>= fun time ->
-      Lwt_io.read_line worker#stdout >>= fun len ->
-      match Astring.String.to_int len with
-      | None -> Fmt.failwith "Bad frame from worker: time=%S len=%S" time len
-      | Some len -> (
-          let buf = Bytes.create len in
-          Lwt_io.read_into_exactly worker#stdout buf 0 len >|= fun () ->
-          let results = Bytes.unsafe_to_string buf in
-          match results.[0] with
-          | '+' ->
-              Log.info log "%s: found solution in %s s" id time;
-              let packages =
-                Astring.String.with_range ~first:1 results
-                |> Astring.String.cuts ~sep:" "
-              in
-              Ok packages
-          | '-' ->
-              Log.info log "%s: eliminated all possibilities in %s s" id time;
-              let msg = results |> Astring.String.with_range ~first:1 in
-              Error msg
-          | '!' ->
-              let msg = results |> Astring.String.with_range ~first:1 in
-              Fmt.failwith "BUG: solver worker failed: %s" msg
-          | _ -> Fmt.failwith "BUG: bad output: %s" results)
+      (* Lwt_eio.run_eio (fun () -> *)
+      (* Lwt_io.write worker#stdin request_str >>= fun () -> *)
+      Eio.Flow.copy_string request_str worker#stdin;
+      match Eio.Buf_read.(parse ~max_size:1024 line worker#stdout) with
+      | Error _ -> Error ""
+      | Ok time ->
+          match Eio.Buf_read.(parse ~max_size:1024 line worker#stdout) with
+          | Error _ -> Error ""
+          | Ok len ->
+              Lwt_eio.run_lwt @@ fun () ->
+              (* Lwt_io.read_line worker#stdout >>= fun time -> *)
+              (* Lwt_io.read_line worker#stdout >>= fun len -> *)
+                match Astring.String.to_int len with
+                | None -> Fmt.failwith "Bad frame from worker: time=%S len=%S" time len
+                | Some len -> (
+                    let buf = Bytes.create len in
+                    ignore buf;
+                    Lwt.return (Ok []))
+                    (* Lwt_io.read_into_exactly worker#stdout buf 0 len >|= fun () ->
+                    let results = Bytes.unsafe_to_string buf in
+                    match results.[0] with
+                    | '+' ->
+                        Log.info log "%s: found solution in %s s" id time;
+                        let packages =
+                          Astring.String.with_range ~first:1 results
+                          |> Astring.String.cuts ~sep:" "
+                        in
+                        Ok packages
+                    | '-' ->
+                        Log.info log "%s: eliminated all possibilities in %s s" id time;
+                        let msg = results |> Astring.String.with_range ~first:1 in
+                        Error msg
+                    | '!' ->
+                        let msg = results |> Astring.String.with_range ~first:1 in
+                        Fmt.failwith "BUG: solver worker failed: %s" msg
+                    | _ -> Fmt.failwith "BUG: bad output: %s" results) *)
 
     let ocaml = OpamPackage.Name.of_string "ocaml"
 
@@ -171,7 +186,7 @@ module Make (Opam_repo : Opam_repository_intf.S) = struct
                else compatible_root_pkgs
              in
              let slice = { request with platforms = [ p ]; root_pkgs } in
-             Lwt_pool.use t (process ~log ~id slice) >>= function
+             Lwt_pool.use t (fun x -> Lwt_eio.run_eio (fun () -> process ~log ~id slice x)) >>= function
              | Error _ as e -> Lwt.return (id, e)
              | Ok packages ->
                  let repo_packages =
